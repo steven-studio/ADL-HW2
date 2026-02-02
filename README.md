@@ -20,3 +20,4 @@ bash preprocess.sh
 ```shell
 python train_intent.py
 ```
+# ADL-HW2
