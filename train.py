@@ -1,4 +1,6 @@
+import collections
 import json
+import numpy as np
 from pathlib import Path
 import torch
 from transformers import (
@@ -148,18 +150,32 @@ def train(train_path, context_path, model_dir):
     print("Loading data...")
     data = load_data(train_path)
     contexts = load_context(context_path)
+
+    # 分割訓練集和驗證集 (90% train, 10% val)
+    split_idx = int(len(data) * 0.9)
+    train_data = data[:split_idx]
+    eval_data = data[split_idx:]
     
-    print(f"Loaded {len(data)} training examples and {len(contexts)} contexts")
+    print(f"Loaded {len(train_data)} training examples and {len(eval_data)} validation examples")
     
-    print("Preparing features...")
-    encodings = prepare_train_features(data, contexts, tokenizer)
-    dataset = QADataset(encodings)
+    print("Preparing training features...")
+    train_encodings = prepare_train_features(train_data, contexts, tokenizer)
+    train_dataset = QADataset(train_encodings)
+    
+    print("Preparing validation features...")
+    eval_encodings = prepare_train_features(eval_data, contexts, tokenizer)
+    eval_dataset = QADataset(eval_encodings)
+
+    # 保存驗證集數據（訓練後評估用）
+    print("Saving validation data...")
+    with open(f"{model_dir}/val_data.json", "w", encoding="utf-8") as f:
+        json.dump(eval_data, f, ensure_ascii=False, indent=2)
 
     print("Starting training...")
     args = TrainingArguments(
         output_dir=model_dir,
         per_device_train_batch_size=4,
-        num_train_epochs=5,
+        num_train_epochs=1,
         learning_rate=2e-5,
         logging_steps=100,
         save_steps=500,
@@ -167,17 +183,145 @@ def train(train_path, context_path, model_dir):
         warmup_steps=500,
         weight_decay=0.01,
         fp16=True,
-        # 加入學習率衰減
-        lr_scheduler_type="cosine",  # 使用 cosine 衰減
+        # 加這三行
+        evaluation_strategy="steps",  # 或 "epoch"
+        eval_steps=500,  # 每 500 steps 評估一次
+        load_best_model_at_end=True,  # 訓練結束載入最佳模型
     )
 
-    trainer = Trainer(model=model, args=args, train_dataset=dataset)
+    trainer = Trainer(
+        model=model, 
+        args=args, 
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+    )
+
     trainer.train()
 
     print("Saving model...")
     model.save_pretrained(model_dir)
     tokenizer.save_pretrained(model_dir)
+    
+    # 訓練完成後，對驗證集進行完整評估
+    print("\n" + "="*60)
+    print("Evaluating on validation set...")
+    print("="*60)
+    
+    val_pred_path = f"{model_dir}/val_predictions.json"
+    predict_for_validation(model_dir, context_path, eval_data, contexts, val_pred_path)
+    
+    # 計算 EM 和 F1
+    print("\nComputing metrics...")
+    predictions = load_data(val_pred_path)
+    
+    em_scores = []
+    f1_scores = []
+    
+    for example in eval_data:
+        qid = example["id"]
+        true_answer = example["answers"][0]["text"]
+        pred_answer = predictions.get(qid, "")
+        
+        em_scores.append(compute_em(pred_answer, true_answer))
+        f1_scores.append(compute_f1(pred_answer, true_answer))
+    
+    val_em = np.mean(em_scores)
+    val_f1 = np.mean(f1_scores)
+    
+    print("\n" + "="*60)
+    print(f"📊 Validation Results:")
+    print(f"   EM:  {val_em:.4f} ({val_em*100:.2f}%)")
+    print(f"   F1:  {val_f1:.4f} ({val_f1*100:.2f}%)")
+    print("="*60)
+    
+    # 保存評估結果
+    with open(f"{model_dir}/val_results.json", "w", encoding="utf-8") as f:
+        json.dump({"em": val_em, "f1": val_f1, "count": len(eval_data)}, f, indent=2)
+    
     print("✓ Training complete!")
+
+
+def predict_for_validation(model_dir, context_path, eval_data, contexts, pred_path):
+    """專門用於驗證集的預測（eval_data 已經是列表格式）"""
+    print("Loading model for validation...")
+    tokenizer = BertTokenizerFast.from_pretrained(model_dir)
+    model = BertForQuestionAnswering.from_pretrained(model_dir)
+    model.eval()
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    
+    print(f"Predicting {len(eval_data)} validation examples...")
+    predictions = {}
+    
+    for i, qa in enumerate(eval_data):
+        if (i + 1) % 100 == 0:
+            print(f"Progress: {i + 1}/{len(eval_data)}")
+        
+        qid = qa["id"]
+        question = qa["question"]
+        
+        # 驗證集只需要預測相關段落（因為已知正確段落）
+        relevant_id = qa["relevant"]
+        context = contexts[relevant_id]
+        
+        inputs = tokenizer(
+            question, 
+            context, 
+            return_tensors="pt",
+            truncation=True,
+            max_length=512
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = model(**inputs)
+        
+        start_scores = outputs.start_logits[0]
+        end_scores = outputs.end_logits[0]
+        
+        start_idx = torch.argmax(start_scores).item()
+        end_idx = torch.argmax(end_scores).item()
+        
+        if end_idx >= start_idx:
+            answer_ids = inputs["input_ids"][0][start_idx:end_idx + 1]
+            answer = tokenizer.decode(answer_ids, skip_special_tokens=True)
+            answer = answer.replace(" ", "")
+        else:
+            answer = ""
+        
+        if not answer:
+            answer = "無答案"
+        
+        predictions[qid] = answer
+    
+    with open(pred_path, "w", encoding="utf-8") as f:
+        json.dump(predictions, f, ensure_ascii=False, indent=2)
+    
+    print(f"✓ Validation predictions saved to {pred_path}")
+
+
+def compute_em(pred, truth):
+    """計算 Exact Match"""
+    return int(pred == truth)
+
+
+def compute_f1(pred, truth):
+    """計算 F1 Score"""
+    pred_tokens = list(pred)
+    truth_tokens = list(truth)
+    
+    common = collections.Counter(pred_tokens) & collections.Counter(truth_tokens)
+    num_same = sum(common.values())
+    
+    if num_same == 0:
+        return 0
+    
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(truth_tokens)
+    f1 = (2 * precision * recall) / (precision + recall)
+    
+    return f1
 
 
 def predict(model_dir, context_path, data_path, pred_path):
