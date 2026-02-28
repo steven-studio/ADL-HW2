@@ -8,6 +8,7 @@ from transformers import (
     BertForQuestionAnswering,
     Trainer,
     TrainingArguments,
+    EarlyStoppingCallback,
 )
 
 MODEL_NAME = "bert-base-chinese"
@@ -175,11 +176,11 @@ def train(train_path, context_path, model_dir):
     args = TrainingArguments(
         output_dir=model_dir,
         per_device_train_batch_size=4,
-        num_train_epochs=1,
+        num_train_epochs=2,
         learning_rate=2e-5,
         logging_steps=100,
         save_steps=500,
-        save_total_limit=2,
+        save_total_limit=10,
         warmup_steps=500,
         weight_decay=0.01,
         fp16=True,
@@ -187,6 +188,8 @@ def train(train_path, context_path, model_dir):
         evaluation_strategy="steps",  # 或 "epoch"
         eval_steps=500,  # 每 500 steps 評估一次
         load_best_model_at_end=True,  # 訓練結束載入最佳模型
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
     )
 
     trainer = Trainer(
@@ -194,12 +197,13 @@ def train(train_path, context_path, model_dir):
         args=args, 
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
     )
 
     trainer.train()
 
     print("Saving model...")
-    model.save_pretrained(model_dir)
+    trainer.save_model(model_dir)   # ✅ 這個會存 trainer.model（best）
     tokenizer.save_pretrained(model_dir)
     
     # 訓練完成後，對驗證集進行完整評估
@@ -277,22 +281,36 @@ def predict_for_validation(model_dir, context_path, eval_data, contexts, pred_pa
         with torch.no_grad():
             outputs = model(**inputs)
         
-        start_scores = outputs.start_logits[0]
-        end_scores = outputs.end_logits[0]
-        
-        start_idx = torch.argmax(start_scores).item()
-        end_idx = torch.argmax(end_scores).item()
-        
-        if end_idx >= start_idx:
-            answer_ids = inputs["input_ids"][0][start_idx:end_idx + 1]
-            answer = tokenizer.decode(answer_ids, skip_special_tokens=True)
-            answer = answer.replace(" ", "")
-        else:
-            answer = ""
-        
-        if not answer:
-            answer = "無答案"
-        
+        start_scores = outputs.start_logits[0]  # (n,)
+        end_scores   = outputs.end_logits[0]    # (n,)
+        n = start_scores.size(0)
+
+        max_answer_length = 80
+
+        token_type_ids = inputs.get("token_type_ids", None)
+        if token_type_ids is not None:
+            tt = token_type_ids[0]  # 0=question, 1=context
+            start_scores = start_scores.masked_fill(tt != 1, float("-inf"))
+            end_scores   = end_scores.masked_fill(tt != 1, float("-inf"))
+
+        score_matrix = start_scores[:, None] + end_scores[None, :]  # (n, n)
+
+        # 1) end >= start
+        mask_triu = torch.triu(torch.ones(n, n, dtype=torch.bool, device=score_matrix.device))
+
+        # 2) end - start + 1 <= max_answer_length
+        idx = torch.arange(n, device=score_matrix.device)
+        mask_len = (idx[None, :] - idx[:, None]) < max_answer_length  # (n,n) True if j-i < L
+
+        mask = mask_triu & mask_len
+        score_matrix = score_matrix.masked_fill(~mask, float("-inf"))
+
+        best_idx = score_matrix.argmax()
+        best_start = (best_idx // n).item()
+        best_end   = (best_idx % n).item()
+
+        answer_ids = inputs["input_ids"][0][best_start:best_end + 1]
+        answer = tokenizer.decode(answer_ids, skip_special_tokens=True).replace(" ", "")
         predictions[qid] = answer
     
     with open(pred_path, "w", encoding="utf-8") as f:
@@ -372,23 +390,41 @@ def predict(model_dir, context_path, data_path, pred_path):
             with torch.no_grad():
                 outputs = model(**inputs)
             
-            start_scores = outputs.start_logits[0]
-            end_scores = outputs.end_logits[0]
-            
-            start_idx = torch.argmax(start_scores).item()
-            end_idx = torch.argmax(end_scores).item()
-            
-            # 計算信心分數
-            score = start_scores[start_idx] + end_scores[end_idx]
-            
-            if end_idx >= start_idx and score > best_score:
+            start_scores = outputs.start_logits[0]  # (n,)
+            end_scores   = outputs.end_logits[0]    # (n,)
+            n = start_scores.size(0)
+
+            max_answer_length = 80  # 你可以調
+
+            # 只允許從 context 取答案（避免抽到 question / special / pad）
+            token_type_ids = inputs.get("token_type_ids", None)
+            if token_type_ids is not None:
+                tt = token_type_ids[0]  # 0=question, 1=context
+                start_scores = start_scores.masked_fill(tt != 1, float("-inf"))
+                end_scores   = end_scores.masked_fill(tt != 1, float("-inf"))
+
+            # 全域最優 span：score(i,j)=start[i]+end[j]，限制 j>=i 且長度<=max_answer_length
+            score_matrix = start_scores[:, None] + end_scores[None, :]  # (n, n)
+
+            idx = torch.arange(n, device=score_matrix.device)
+            mask_triu = torch.triu(torch.ones(n, n, dtype=torch.bool, device=score_matrix.device))  # j>=i
+            mask_len  = (idx[None, :] - idx[:, None]) < max_answer_length  # j-i < L
+            mask = mask_triu & mask_len
+
+            score_matrix = score_matrix.masked_fill(~mask, float("-inf"))
+
+            best_idx = score_matrix.argmax()
+            start_idx = (best_idx // n).item()
+            end_idx   = (best_idx % n).item()
+
+            score = score_matrix.view(-1)[best_idx]  # 這就是該段落的最佳分數
+
+            if score > best_score:
                 best_score = score
                 answer_ids = inputs["input_ids"][0][start_idx:end_idx + 1]
-                answer = tokenizer.decode(answer_ids, skip_special_tokens=True)
-                # BERT 中文會有空格，移除
-                answer = answer.replace(" ", "")
+                answer = tokenizer.decode(answer_ids, skip_special_tokens=True).replace(" ", "")
                 best_answer = answer
-        
+                        
         # 如果答案為空，用問題中的關鍵字作為預設答案
         if not best_answer or best_answer.strip() == "":
             best_answer = "無答案"  # 給一個預設值
